@@ -1,0 +1,234 @@
+// ─────────────────────────────────────────────────────────────────────
+// Schema de datos — Centro Odontológico
+//
+// Cada `model` se convierte en una tabla de la base de datos.
+// Los `enum` son listas de valores fijos (se guardan legibles en la base).
+// Documentación: https://pris.ly/d/prisma-schema
+// ─────────────────────────────────────────────────────────────────────
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ══════════════════════ Pacientes ══════════════════════
+
+model Paciente {
+  id              String    @id @default(cuid()) // id único autogenerado
+  nombre          String
+  apellido        String
+  dni             String?   @unique // el "?" significa campo opcional
+  telefono        String // número de WhatsApp
+  email           String?
+  fechaNacimiento DateTime?
+
+  // Historia médica general (previa a cualquier tratamiento)
+  alergias       String?
+  medicacion     String?
+  preexistencias String?
+
+  // Ortodoncia
+  ortodoncia            Boolean   @default(false)
+  fechaInicioOrtodoncia DateTime?
+
+  activo Boolean  @default(true) // false = dado de baja
+  notas   String?
+
+  createdAt DateTime @default(now()) // fecha de alta en el sistema
+  updatedAt DateTime @updatedAt // se actualiza sola en cada edición
+
+  // Relaciones "uno a muchos": un paciente tiene muchos turnos, etc.
+  turnos         Turno[]
+  evoluciones    Evolucion[]
+  pagos          Pago[]
+  odontograma    EstadoPieza[]
+  notificaciones NotificacionLog[]
+}
+
+// ══════════════════════ Turnos (agenda) ══════════════════════
+
+// Ciclo de vida de un turno:
+// PENDIENTE → recién reservado (web o admin)
+// CONFIRMADO → el paciente confirmó por WhatsApp
+// ATENDIDO → se atendió
+// CANCELADO → se canceló (el horario vuelve a estar disponible)
+// NO_ASISTIO → no vino (queda en el historial del paciente)
+enum EstadoTurno {
+  PENDIENTE
+  CONFIRMADO
+  ATENDIDO
+  CANCELADO
+  NO_ASISTIO
+}
+
+enum OrigenTurno {
+  ADMIN // lo cargó la dentista
+  WEB // lo reservó el paciente desde la página pública
+}
+
+model Turno {
+  id          String       @id @default(cuid())
+  pacienteId  String
+  paciente    Paciente     @relation(fields: [pacienteId], references: [id], onDelete: Cascade)
+  fechaHora   DateTime // fecha y hora exacta del turno
+  duracionMin Int          @default(30) // minutos (se ajusta según el tratamiento)
+  motivo      String?
+  estado      EstadoTurno  @default(PENDIENTE)
+  origen      OrigenTurno  @default(ADMIN)
+  notas       String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  evoluciones    Evolucion[]
+  notificaciones NotificacionLog[]
+
+  @@index([fechaHora]) // acelera la consulta de la agenda por fecha
+  @@index([pacienteId, fechaHora]) // acelera el historial de un paciente
+}
+
+// ══════════════════════ Configuración de la agenda ══════════════════════
+
+// Un registro por día de atención (ej.: lunes de "09:00" a "18:00").
+// Si un día no tiene registro, ese día no se atiende.
+model HorarioAtencion {
+  id         String @id @default(cuid())
+  diaSemana  Int // 0 = domingo, 1 = lunes, ... 6 = sábado
+  horaInicio String // formato "HH:mm"
+  horaFin    String
+}
+
+// Un único registro con la configuración general del sistema
+model ConfiguracionSistema {
+  id                     String @id @default(cuid())
+  duracionTurnoDefecto   Int    @default(30) // minutos por defecto por turno
+  anticipacionWebHoras   Int    @default(3) // anticipación mínima para reservar online
+  recordatorioHorasAntes Int    @default(24) // cuántas horas antes se envía el recordatorio
+  pacienteInactivoMeses  Int    @default(6) // meses sin venir = "paciente inactivo"
+}
+
+// Bloqueos de agenda: feriados, ausencias, almuerzos, etc.
+model BloqueoHorario {
+  id        String   @id @default(cuid())
+  inicio    DateTime
+  fin       DateTime
+  motivo    String?
+  createdAt DateTime @default(now())
+}
+
+// ══════════════════════ Catálogo y ficha de evolución ══════════════════════
+
+// El catálogo de trabajos que hace el consultorio, con su precio de referencia
+model TratamientoCatalogo {
+  id          String   @id @default(cuid())
+  nombre      String // "Consulta", "Obturación", ...
+  descripcion String?
+  precioBase  Decimal  @db.Decimal(10, 2) //Decimal y NUNCA Float para dinero
+  activo      Boolean  @default(true)
+  createdAt   DateTime @default(now())
+
+  evoluciones Evolucion[]
+}
+
+// Una entrada en la ficha del paciente (su historial clínico).
+// La ficha completa = la lista de evoluciones, de la más reciente a la más vieja.
+model Evolucion {
+  id            String              @id @default(cuid())
+  pacienteId    String
+  paciente      Paciente            @relation(fields: [pacienteId], references: [id], onDelete: Cascade)
+  turnoId       String?
+  turno         Turno?              @relation(fields: [turnoId], references: [id], onDelete: SetNull) // la evolución queda aunque se borre el turno
+  fecha         DateTime            @default(now())
+  tratamientoId String?
+  tratamiento   TratamientoCatalogo? @relation(fields: [tratamientoId], references: [id], onDelete: SetNull)
+  piezas        String? // "16, 17" — nomenclatura FDI (piezas 11 a 48)
+  descripcion   String // qué se hizo
+  montoCobrado  Decimal             @default(0) @db.Decimal(10, 2)
+  createdAt     DateTime            @default(now())
+  updatedAt     DateTime            @updatedAt
+
+  pagos Pago[]
+
+  @@index([pacienteId, fecha]) // historial ordenado por fecha
+}
+
+// ══════════════════════ Pagos ══════════════════════
+
+enum MetodoPago {
+  EFECTIVO
+  TRANSFERENCIA
+  TARJETA
+  OTRO
+}
+
+model Pago {
+  id          String      @id @default(cuid())
+  pacienteId  String
+  paciente    Paciente    @relation(fields: [pacienteId], references: [id], onDelete: Cascade)
+  evolucionId String?
+  evolucion   Evolucion?  @relation(fields: [evolucionId], references: [id], onDelete: SetNull)
+  monto       Decimal     @db.Decimal(10, 2)
+  metodo      MetodoPago  @default(EFECTIVO)
+  concepto    String? // ej.: "cuota ortodoncia — marzo"
+  fecha       DateTime    @default(now())
+  createdAt   DateTime    @default(now())
+}
+
+// ══════════════════════ Odontograma (mapa de piezas) ══════════════════════
+
+enum EstadoDentario {
+  SANO
+  CARIADO
+  OBTURADO
+  CORONA
+  IMPLANTE
+  AUSENTE
+  EN_TRATAMIENTO
+}
+
+// Estado de UNA pieza dentaria de UN paciente.
+// Solo se crean registros de las piezas con estado != SANO
+model EstadoPieza {
+  id         String         @id @default(cuid())
+  pacienteId String
+  paciente   Paciente       @relation(fields: [pacienteId], references: [id], onDelete: Cascade)
+  pieza      String // "16", "37", ... (nomenclatura FDI)
+  estado     EstadoDentario @default(SANO)
+  updatedAt  DateTime       @updatedAt
+
+  @@unique([pacienteId, pieza]) // una pieza por paciente, sin duplicados
+}
+
+// ══════════════════════ Notificaciones de WhatsApp ══════════════════════
+
+enum TipoNotificacion {
+  RECORDATORIO_TURNO // "mañana tenés tu turno, confirmá"
+  CONFIRMACION_RESERVA // confirmación al reservar online
+  CONTROL_SEMESTRAL // "hace 6 meses no venís, agendá tu control"
+}
+
+enum EstadoNotificacion {
+  ENVIADA
+  ENTREGADA
+  FALLIDA
+  RESPONDIDA
+}
+
+// Registro de cada WhatsApp enviado: qué se envió, cuándo y qué respondió
+model NotificacionLog {
+  id           String             @id @default(cuid())
+  turnoId      String?
+  turno        Turno?             @relation(fields: [turnoId], references: [id], onDelete: Cascade)
+  pacienteId   String?
+  paciente     Paciente?          @relation(fields: [pacienteId], references: [id], onDelete: Cascade)
+  tipo         TipoNotificacion
+  estado       EstadoNotificacion @default(ENVIADA)
+  mensaje      String?
+  respuesta    String? // "CONFIRMAR" o "CANCELAR" (llega por webhook)
+  enviadoEn    DateTime           @default(now())
+  respondidoEn DateTime?
+}
